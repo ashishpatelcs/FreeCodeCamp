@@ -1,67 +1,54 @@
 // enable debug for gulp
 process.env.DEBUG = process.env.DEBUG || 'fcc:*';
+require('dotenv').load();
 
 require('babel-core/register');
-var Rx = require('rx'),
+const Rx = require('rx'),
   gulp = require('gulp'),
   path = require('path'),
   debug = require('debug')('fcc:gulp'),
   yargs = require('yargs'),
   sortKeys = require('sort-keys'),
   del = require('del'),
-
   // utils
   plumber = require('gulp-plumber'),
+  named = require('vinyl-named'),
   notify = require('gulp-notify'),
   gutil = require('gulp-util'),
   reduce = require('gulp-reduce-file'),
-  concat = require('gulp-concat'),
-  uglify = require('gulp-uglify'),
-  merge = require('merge-stream'),
-  babel = require('gulp-babel'),
   sourcemaps = require('gulp-sourcemaps'),
-  gulpif = require('gulp-if'),
-
   // react app
   webpack = require('webpack'),
   webpackStream = require('webpack-stream'),
   webpackDevMiddleware = require('webpack-dev-middleware'),
   webpackHotMiddleware = require('webpack-hot-middleware'),
   webpackConfig = require('./webpack.config.js'),
-
   // server process
   nodemon = require('gulp-nodemon'),
   browserSync = require('browser-sync'),
-
   // css
   less = require('gulp-less'),
-
   // rev
   rev = require('gulp-rev'),
   revDel = require('rev-del'),
-
-  // lint
-  jsonlint = require('gulp-jsonlint'),
-  eslint = require('gulp-eslint'),
-
-  // unit-tests
-  tape = require('gulp-tape'),
-  tapSpec = require('tap-spec');
+  { createPathMigrationMap } = require('./seed/createPathMigrationMap');
 
 Rx.config.longStackSupport = true;
-var sync = browserSync.create('fcc-sync-server');
-var reload = sync.reload.bind(sync);
+const sync = browserSync.create('fcc-sync-server');
 
 // user definable
-var __DEV__ = !yargs.argv.p;
-var port = yargs.argv.port || process.env.PORT || '3001';
-var syncPort = yargs.argv['sync-port'] || process.env.SYNC_PORT || '3000';
+const __DEV__ = !yargs.argv.p;
+const host = process.env.HOST || 'localhost';
+const port = yargs.argv.port || process.env.PORT || '3001';
+const syncPort = yargs.argv['sync-port'] || process.env.SYNC_PORT || '3000';
+
 // make sure sync ui port does not interfere with proxy port
-var syncUIPort = yargs.argv['sync-ui-port'] ||
+const syncUIPort =
+  yargs.argv['sync-ui-port'] ||
   process.env.SYNC_UI_PORT ||
   parseInt(syncPort, 10) + 2;
 
-var paths = {
+const paths = {
   server: './server/server.js',
   serverIgnore: [
     'gulpfile.js',
@@ -76,56 +63,13 @@ var paths = {
   publicJs: './public/js',
   css: 'public/css',
 
-  loopback: {
-    client: './client/loopbackClient',
-    root: path.join(__dirname, 'client/'),
-    clientName: 'lbApp'
-  },
-
   client: {
     src: './client',
     dest: 'public/js'
   },
 
-  vendorChallenges: [
-    'public/bower_components/jshint/dist/jshint.js',
-    'public/bower_components/chai/chai.js',
-    'public/bower_components/CodeMirror/lib/codemirror.js',
-    'public/bower_components/CodeMirror/addon/comment/comment.js',
-    'public/bower_components/CodeMirror/addon/edit/closebrackets.js',
-    'public/bower_components/CodeMirror/addon/edit/matchbrackets.js',
-    'public/bower_components/CodeMirror/addon/lint/lint.js',
-    'public/bower_components/CodeMirror/addon/lint/javascript-lint.js',
-    'public/bower_components/CodeMirror/mode/javascript/javascript.js',
-    'public/bower_components/CodeMirror/mode/xml/xml.js',
-    'public/bower_components/CodeMirror/mode/css/css.js',
-    'public/bower_components/CodeMirror/mode/htmlmixed/htmlmixed.js',
-    'node_modules/emmet-codemirror/dist/emmet.js',
-    'public/js/lib/loop-protect/loop-protect.js'
-  ],
-
-  vendorMain: [
-    'public/bower_components/jquery/dist/jquery.min.js',
-    'public/bower_components/bootstrap/dist/js/bootstrap.min.js',
-    'public/bower_components/d3/d3.min.js',
-    'public/bower_components/moment/min/moment.min.js',
-
-    'public/bower_components/' +
-      'moment-timezone/builds/moment-timezone-with-data.min.js',
-
-    'public/bower_components/mousetrap/mousetrap.min.js',
-    'public/bower_components/lightbox2/dist/js/lightbox.min.js',
-    'public/bower_components/rxjs/dist/rx.all.min.js'
-  ],
-
-  js: [
-    'client/main.js',
-    'client/frame-runner.js',
-    'client/plugin.js'
-  ],
-
   less: './client/less/main.less',
-  lessFiles: './client/less/**/*.less',
+  lessFiles: ['./client/**/*.less', './common/**/*.less'],
 
   manifest: 'server/manifests/',
 
@@ -134,28 +78,19 @@ var paths = {
     dest: 'common/app'
   },
 
-  syncWatch: [
-    'public/**/*.*'
-  ],
+  reactFiles: ['./client/**/*.js', './news/**/*.js', 'common/**/*.js'],
 
-  challenges: [
-    'seed/challenges/*/*.json'
-  ]
+  syncWatch: ['public/**/*.*']
 };
 
-var webpackOptions = {
-  devtool: 'inline-source-map'
-};
+const errorNotifier = notify.onError({
+  title: 'Compile Error',
+  message: '<%= error %>'
+});
 
-function errorHandler() {
-  var args = Array.prototype.slice.call(arguments);
-
+function errorHandler(...args) {
   // Send error to notification center with gulp-notify
-  notify.onError({
-    title: 'Compile Error',
-    message: '<%= error %>'
-  }).apply(this, args);
-
+  errorNotifier.apply(this, args);
   // Keep gulp from hanging on this task
   this.emit('end');
 }
@@ -172,12 +107,18 @@ function delRev(dest, manifestName) {
 }
 
 gulp.task('serve', function(cb) {
-  var called = false;
-  nodemon({
+  let called = false;
+  let execParams = path.normalize('node_modules/.bin/babel-node');
+  // When in development we can spawn a node debugger
+  // https://nodejs.org/en/docs/inspector/
+  if (__DEV__) {
+    execParams = execParams + ' --inspect';
+  }
+  const monitor = nodemon({
     script: paths.server,
     ext: '.jsx .js .json',
     ignore: paths.serverIgnore,
-    exec: path.join(__dirname, 'node_modules/.bin/babel-node'),
+    exec: execParams,
     env: {
       NODE_ENV: process.env.NODE_ENV || 'development',
       DEBUG: process.env.DEBUG || 'fcc:*',
@@ -195,38 +136,45 @@ gulp.task('serve', function(cb) {
         debug('Nodemon will restart due to changes in: ', files);
       }
     });
+
+  process.once('SIGINT', () => {
+    monitor.once('exit', () => {
+      /* eslint-disable no-process-exit */
+      process.exit(0);
+      /* eslint-enable no-process-exit */
+    });
+  });
 });
 
-var syncDepenedents = [
-  'serve',
-  'js',
-  'less'
-];
+const syncDepenedents = ['serve', 'less'];
 
 gulp.task('dev-server', syncDepenedents, function() {
-  webpackConfig.entry.bundle = [
+  const devMiddleware = [
     'webpack/hot/dev-server',
     'webpack-hot-middleware/client'
-  ].concat(webpackConfig.entry.bundle);
+  ];
+  Object.keys(webpackConfig.entry).forEach(key => {
+    webpackConfig.entry[key] = [webpackConfig.entry[key]].concat(devMiddleware);
+  });
 
-  var bundler = webpack(webpackConfig);
+  const bundler = webpack(webpackConfig);
   sync.init(null, {
     ui: {
       port: syncUIPort
     },
     proxy: {
-      target: `http://localhost:${port}`,
+      target: `http://${host}:${port}`,
       reqHeaders: ({ url: { hostname } }) => ({
         host: `${hostname}:${syncPort}`
       })
     },
-    logLeval: 'debug',
+    logLevel: 'info',
     files: paths.syncWatch,
     port: syncPort,
     open: false,
     middleware: [
       webpackDevMiddleware(bundler, {
-        publicPath: webpackConfig.output.publicPath,
+        publicPath: '/js',
         stats: 'errors-only'
       }),
       webpackHotMiddleware(bundler)
@@ -234,61 +182,39 @@ gulp.task('dev-server', syncDepenedents, function() {
   });
 });
 
-gulp.task('lint-js', function() {
-  return gulp.src([
-    'common/**/*.js',
-    'common/**/*.jsx',
-    'client/**/*.js',
-    'client/**/*.jsx',
-    'server/**/*.js',
-    'config/**/*.js'
-  ])
-    .pipe(eslint())
-    .pipe(eslint.format());
-});
-
-gulp.task('lint-json', function() {
-  return gulp.src(paths.challenges)
-    .pipe(jsonlint())
-    .pipe(jsonlint.reporter());
-});
-
-gulp.task('test-challenges', ['lint-json']);
-
-gulp.task('pack-client', function() {
-  if (!__DEV__) { console.log('\n\nbundling production\n\n'); }
-
-  function condition(file) {
-    var filepath = file.relative;
-    return __DEV__ || (/json$/).test('' + filepath);
+gulp.task('pack-apps', function() {
+  if (!__DEV__) {
+    console.log('\n\nbundling apps - production\n\n');
   }
 
-  var dest = webpackConfig.output.path;
+  const dest = webpackConfig.output.path;
+  const sources = Object.keys(webpackConfig.entry).map(
+    key => webpackConfig.entry[key]
+  );
 
-  return gulp.src(webpackConfig.entry.bundle)
-    .pipe(plumber({ errorHandler: errorHandler }))
-    .pipe(webpackStream(Object.assign(
-      {},
-      webpackConfig,
-      webpackOptions
-    )))
-    .pipe(gulpif(condition, gutil.noop(), uglify()))
+  return gulp
+    .src(sources)
+    .pipe(named())
+    .pipe(plumber({ errorHandler }))
+    .pipe(webpackStream(webpackConfig))
     .pipe(gulp.dest(dest));
 });
 
-var webpackManifestFiles = [ 'react-manifest.json', 'chunk-manifest.json' ];
-gulp.task('move-webpack-manifest', ['pack-client'], function() {
-  var files = webpackManifestFiles.map(function(filename) {
+const webpackManifestFiles = ['react-manifest.json', 'chunk-manifest.json'];
+gulp.task('move-webpack-manifest', ['pack-apps'], function() {
+  const files = webpackManifestFiles.map(function(filename) {
     return path.join(webpackConfig.output.path, filename);
   });
   return gulp.src(files).pipe(gulp.dest(paths.manifest));
 });
 
-var cleanDeps = ['pack-client', 'move-webpack-manifest'];
+const cleanDeps = ['pack-apps', 'move-webpack-manifest'];
 gulp.task('clean-webpack-manifest', cleanDeps, function() {
-  return del(webpackManifestFiles.map(function(filename) {
-    return path.join(webpackConfig.output.path, filename);
-  }))
+  return del(
+    webpackManifestFiles.map(function(filename) {
+      return path.join(webpackConfig.output.path, filename);
+    })
+  )
     .then(function(pathsDeleted) {
       gutil.log('[clean-webpack-manifest]', 'paths deleted' + pathsDeleted);
     })
@@ -298,152 +224,74 @@ gulp.task('clean-webpack-manifest', cleanDeps, function() {
 });
 
 gulp.task('less', function() {
-  var manifestName = 'css-manifest.json';
-  var dest = paths.css;
-  return gulp.src(paths.less)
-    .pipe(plumber({ errorHandler: errorHandler }))
-    .pipe(__DEV__ ? sourcemaps.init() : gutil.noop())
-    // compile
-    .pipe(less({
-      paths: [ path.join(__dirname, 'less', 'includes') ]
-    }))
-    .pipe(__DEV__ ?
-      sourcemaps.write({ sourceRoot: '/less' }) :
-      gutil.noop()
-    )
-    .pipe(gulp.dest(dest))
-    // add revision
-    .pipe(__DEV__ ? gutil.noop() : rev())
-    // copy files to public
-    .pipe(__DEV__ ? gutil.noop() : gulp.dest(dest))
-    // create and merge manifest
-    .pipe(__DEV__ ? gutil.noop() : rev.manifest(manifestName))
-    .pipe(__DEV__ ? gutil.noop() : delRev(
-      dest,
-      manifestName
-    ))
-    .pipe(__DEV__ ? gutil.noop() : gulp.dest(paths.manifest));
-});
-
-function getFilesGlob(files) {
-  if (!__DEV__) {
-    return files;
-  }
-  return files.map(function(file) {
-    return file
-      .replace('.min.', '.')
-      // moment breaks the pattern
-      .replace('/min/', '/');
-  });
-}
-
-gulp.task('js', function() {
-  var manifestName = 'js-manifest.json';
-  var dest = paths.publicJs;
-
-  var jsFiles = merge(
-
-    gulp.src(getFilesGlob(paths.vendorMain))
+  const manifestName = 'css-manifest.json';
+  const dest = paths.css;
+  return (
+    gulp
+      .src(paths.less)
+      .pipe(plumber({ errorHandler }))
       .pipe(__DEV__ ? sourcemaps.init() : gutil.noop())
-      .pipe(concat('vendor-main.js'))
+      // compile
       .pipe(
-        __DEV__ ?
-          sourcemaps.write({ sourceRoot: '/vendor' }) :
-          gutil.noop()
-      ),
-
-    gulp.src(paths.vendorChallenges)
-      .pipe(__DEV__ ? sourcemaps.init() : gutil.noop())
-      .pipe(__DEV__ ? gutil.noop() : uglify())
-      .pipe(concat('vendor-challenges.js'))
-      .pipe(
-        __DEV__ ?
-          sourcemaps.write({ sourceRoot: '/vendor' }) :
-          gutil.noop()
-      ),
-
-    gulp.src(paths.js)
-      .pipe(plumber({ errorHandler: errorHandler }))
-      .pipe(babel())
-      .pipe(__DEV__ ? gutil.noop() : uglify())
+        less({
+          paths: [
+            path.join(__dirname, 'client', 'less'),
+            path.join(__dirname, 'common')
+          ]
+        })
+      )
+      .pipe(__DEV__ ? sourcemaps.write({ sourceRoot: '/less' }) : gutil.noop())
+      .pipe(gulp.dest(dest))
+      // add revision
+      .pipe(__DEV__ ? gutil.noop() : rev())
+      // copy files to public
+      .pipe(__DEV__ ? gutil.noop() : gulp.dest(dest))
+      // create and merge manifest
+      .pipe(__DEV__ ? gutil.noop() : rev.manifest(manifestName))
+      .pipe(__DEV__ ? gutil.noop() : delRev(dest, manifestName))
+      .pipe(__DEV__ ? gutil.noop() : gulp.dest(paths.manifest))
   );
-
-  return jsFiles
-    .pipe(gulp.dest(dest))
-    // create registry file
-    .pipe(__DEV__ ? gutil.noop() : rev())
-    // copy revisioned assets to dest
-    .pipe(__DEV__ ? gutil.noop() : gulp.dest(dest))
-    // create manifest file
-    .pipe(__DEV__ ? gutil.noop() : rev.manifest(manifestName))
-    .pipe(__DEV__ ? gutil.noop() : delRev(
-      dest,
-      manifestName
-    ))
-    // copy manifest file to dest
-    .pipe(__DEV__ ? gutil.noop() : gulp.dest(paths.manifest));
 });
 
-
-function collector(file, memo) {
-  return Object.assign({}, JSON.parse(file.contents), memo);
-}
+const collector = (file, memo) =>
+  Object.assign(memo, JSON.parse(file.contents));
 
 function done(manifest) {
   return sortKeys(manifest);
 }
 
-var buildDependents = [
-  'less',
-  'js',
-  'pack-client',
-  'move-webpack-manifest'
-];
+const buildDependents = ['less', 'pack-apps', 'move-webpack-manifest'];
 
 gulp.task('build-manifest', buildDependents, function() {
-  return gulp.src(paths.manifest + '*.json')
+  return gulp
+    .src(paths.manifest + '*.json')
     .pipe(reduce('rev-manifest.json', collector, done, {}))
     .pipe(gulp.dest('server/'));
 });
 
+gulp.task('generate-migration-map', done => {
+  createPathMigrationMap().then(done);
+});
+
 gulp.task('build', [
   'less',
-  'js',
-  'pack-client',
+  'pack-apps',
   'move-webpack-manifest',
   'clean-webpack-manifest',
-  'build-manifest'
+  'build-manifest',
+  'generate-migration-map'
 ]);
 
-var watchDependents = [
-  'less',
-  'js',
-  'serve',
-  'dev-server'
-];
-
-gulp.task('reload', function() {
-  notify({ message: 'test changed' });
-  reload();
-});
+const watchDependents = ['less', 'serve', 'dev-server'];
 
 gulp.task('watch', watchDependents, function() {
   gulp.watch(paths.lessFiles, ['less']);
-  gulp.watch(paths.js.concat(paths.vendorChallenges), ['js']);
-  gulp.watch(paths.challenges, ['test-challenges', 'reload']);
-  gulp.watch(paths.js, ['js']);
 });
 
 gulp.task('default', [
   'less',
   'serve',
   'watch',
-  'dev-server'
+  'dev-server',
+  'generate-migration-map'
 ]);
-
-gulp.task('test', function() {
-  return gulp.src('test/**/*.js')
-    .pipe(tape({
-      reporter: tapSpec()
-    }));
-});
